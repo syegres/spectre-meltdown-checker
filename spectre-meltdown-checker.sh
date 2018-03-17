@@ -18,6 +18,7 @@ exit_cleanup()
 	# cleanup the temp decompressed config & kernel image
 	[ -n "$dumped_config" ] && [ -f "$dumped_config" ] && rm -f "$dumped_config"
 	[ -n "$vmlinuxtmp"    ] && [ -f "$vmlinuxtmp"    ] && rm -f "$vmlinuxtmp"
+	[ -n "$vmlinuxtmp2"   ] && [ -f "$vmlinuxtmp2"   ] && rm -f "$vmlinuxtmp2"
 	[ "$mounted_debugfs" = 1 ] && umount /sys/kernel/debug 2>/dev/null
 	[ "$insmod_cpuid"    = 1 ] && rmmod cpuid 2>/dev/null
 	[ "$insmod_msr"      = 1 ] && rmmod msr 2>/dev/null
@@ -50,6 +51,8 @@ show_usage()
 		--no-sysfs			Don't use the /sys interface even if present
 		--sysfs-only			Only use the /sys interface, don't run our own checks
 		--coreos			Special mode for CoreOS (use an ephemeral toolbox to inspect kernel)
+		--arch-prefix PREFIX		Specify a prefix for cross-inspecting a kernel of a different arch, for example "aarch64-linux-gnu-",
+						so that invoked tools such as objdump will be prefixed with this (i.e. aarch64-linux-gnu-objdump)
 		--batch text			Produce machine readable output, this is the default if --batch is specified alone
 		--batch json			Produce JSON output formatted for Puppet, Ansible, Chef...
 		--batch nrpe			Produce machine readable output formatted for NRPE
@@ -114,6 +117,7 @@ opt_allvariants=1
 opt_no_sysfs=0
 opt_sysfs_only=0
 opt_coreos=0
+opt_arch_prefix=''
 
 global_critical=0
 global_unknown=0
@@ -392,6 +396,9 @@ while [ -n "$1" ]; do
 		[ $ret -ne 0 ] && exit 255
 		shift 2
 		opt_live=0
+	elif [ "$1" = "--arch-prefix" ]; then
+		opt_arch_prefix="$2"
+		shift 2
 	elif [ "$1" = "--live" ]; then
 		opt_live_explicit=1
 		shift
@@ -556,7 +563,7 @@ vmlinux=''
 vmlinux_err=''
 check_vmlinux()
 {
-	readelf -h "$1" >/dev/null 2>&1 && return 0
+	${opt_arch_prefix}readelf -h "$1" >/dev/null 2>&1 && return 0
 	return 1
 }
 
@@ -566,6 +573,7 @@ try_decompress()
 	# "grep" that report the byte offset of the line instead of the pattern.
 
 	# Try to find the header ($1) and decompress from here
+	_debug "try_decompress: looking for $3 magic in $6"
 	for     pos in $(tr "$1\n$2" "\n$2=" < "$6" | grep -abo "^$2")
 	do
 		_debug "try_decompress: magic for $3 found at offset $pos"
@@ -575,13 +583,22 @@ try_decompress()
 		fi
 		pos=${pos%%:*}
 		# shellcheck disable=SC2086
-		tail -c+$pos "$6" 2>/dev/null | $3 $4 > "$vmlinuxtmp" 2>/dev/null
-		if check_vmlinux "$vmlinuxtmp"; then
+		tail -c+$pos "$6" 2>/dev/null | $3 $4 > "$vmlinuxtmp" 2>/dev/null; ret=$?
+		if [ ! -s "$vmlinuxtmp" ]; then
+			# don't rely on $ret, sometimes it's != 0 but worked
+			# (e.g. gunzip ret=2 just means there was trailing garbage)
+			_debug "try_decompress: decompression with $3 failed (err=$ret)"
+		elif check_vmlinux "$vmlinuxtmp"; then
 			vmlinux="$vmlinuxtmp"
 			_debug "try_decompress: decompressed with $3 successfully!"
 			return 0
+		elif [ "$3" != "cat" ]; then
+			_debug "try_decompress: decompression with $3 worked but result is not a kernel, trying with an offset"
+			[ -z "$vmlinuxtmp2" ] && vmlinuxtmp2=$(mktemp /tmp/vmlinux-XXXXXX)
+			cat "$vmlinuxtmp" > "$vmlinuxtmp2"
+			try_decompress '\177ELF' xxy 'cat' '' cat "$vmlinuxtmp2" && return 0
 		else
-			_debug "try_decompress: decompression with $3 did not work"
+			_debug "try_decompress: decompression with $3 worked but result is not a kernel"
 		fi
 	done
 	return 1
@@ -608,6 +625,7 @@ extract_vmlinux()
 	try_decompress '\211\114\132'     xy    'lzop'  '-d'    lzop        "$1" && return 0
 	try_decompress '\002\041\114\030' xyy   'lz4'   '-d -l' liblz4-tool "$1" && return 0
 	try_decompress '\177ELF'          xxy   'cat'   ''      cat         "$1" && return 0
+	_verbose "Couldn't extract the kernel image, accuracy might be reduced"
 	return 1
 }
 
@@ -991,9 +1009,9 @@ if [ "$bad_accuracy" = 1 ]; then
 fi
 
 if [ -e "$opt_kernel" ]; then
-	if ! which readelf >/dev/null 2>&1; then
+	if ! which ${opt_arch_prefix}readelf >/dev/null 2>&1; then
 		_debug "readelf not found"
-		vmlinux_err="missing 'readelf' tool, please install it, usually it's in the 'binutils' package"
+		vmlinux_err="missing '${opt_arch_prefix}readelf' tool, please install it, usually it's in the 'binutils' package"
 	elif [ "$opt_sysfs_only" = 1 ]; then
 		vmlinux_err='kernel image decompression skipped'
 	else
@@ -1006,10 +1024,10 @@ fi
 if [ -z "$vmlinux" ] || [ ! -r "$vmlinux" ]; then
 	[ -z "$vmlinux_err" ] && vmlinux_err="couldn't extract your kernel from $opt_kernel"
 else
-	vmlinux_version=$(strings "$vmlinux" 2>/dev/null | grep '^Linux version ' | head -1)
+	vmlinux_version=$(${opt_arch_prefix}strings "$vmlinux" 2>/dev/null | grep '^Linux version ' | head -1)
 	if [ -z "$vmlinux_version" ]; then
 		# try harder with some kernels (such as Red Hat) that don't have ^Linux version before their version string
-		vmlinux_version=$(strings "$vmlinux" 2>/dev/null | grep -E '^[[:alnum:]][^[:space:]]+ \([^[:space:]]+\) #[0-9]+ .+ (19|20)[0-9][0-9]$' | head -1)
+		vmlinux_version=$(${opt_arch_prefix}strings "$vmlinux" 2>/dev/null | grep -E '^[[:alnum:]][^[:space:]]+ \([^[:space:]]+\) #[0-9]+ .+ (19|20)[0-9][0-9]$' | head -1)
 	fi
 	if [ -n "$vmlinux_version" ]; then
 		# in live mode, check if the img we found is the correct one
@@ -1259,7 +1277,7 @@ check_redhat_canonical_spectre()
 	# if we were already called, don't do it again
 	[ -n "$redhat_canonical_spectre" ] && return
 
-	if ! which strings >/dev/null 2>&1; then
+	if ! which ${opt_arch_prefix}strings >/dev/null 2>&1; then
 		redhat_canonical_spectre=-1
 	elif [ -n "$vmlinux_err" ]; then
 		redhat_canonical_spectre=-2
@@ -1268,7 +1286,7 @@ check_redhat_canonical_spectre()
 		# let's use the same way than the official Red Hat detection script,
 		# and detect their specific variant2 patch. If it's present, it means
 		# that the variant1 patch is also present (both were merged at the same time)
-		if strings "$vmlinux" | grep -qw noibrs && strings "$vmlinux" | grep -qw noibpb; then
+		if ${opt_arch_prefix}strings "$vmlinux" | grep -qw noibrs && ${opt_arch_prefix}strings "$vmlinux" | grep -qw noibpb; then
 			_debug "found redhat/canonical version of the variant2 patch (implies variant1)"
 			redhat_canonical_spectre=1
 		else
@@ -1283,6 +1301,7 @@ check_redhat_canonical_spectre()
 check_variant1()
 {
 	_info "\033[1;34mCVE-2017-5753 [bounds check bypass] aka 'Spectre Variant 1'\033[0m"
+cp "$vmlinux" /tmp/out
 
 	status=UNK
 	sys_interface_available=0
@@ -1331,7 +1350,7 @@ check_variant1()
 		_info_nol "* Kernel has the Red Hat/Ubuntu patch: "
 		check_redhat_canonical_spectre
 		if [ "$redhat_canonical_spectre" = -1 ]; then
-			pstatus yellow UNKNOWN "missing 'strings' tool, please install it, usually it's in the binutils package"
+			pstatus yellow UNKNOWN "missing '${opt_arch_prefix}strings' tool, please install it, usually it's in the binutils package"
 		elif [ "$redhat_canonical_spectre" = -2 ]; then
 			pstatus yellow UNKNOWN "couldn't check ($vmlinux_err)"
 		elif [ "$redhat_canonical_spectre" = 1 ]; then
@@ -1347,8 +1366,8 @@ check_variant1()
 			if [ -n "$vmlinux_err" ]; then
 				pstatus yellow UNKNOWN "couldn't check ($vmlinux_err)"
 			else
-				if ! which objdump >/dev/null 2>&1; then
-					pstatus yellow UNKNOWN "missing 'objdump' tool, please install it, usually it's in the binutils package"
+				if ! which ${opt_arch_prefix}objdump >/dev/null 2>&1; then
+					pstatus yellow UNKNOWN "missing '${opt_arch_prefix}objdump' tool, please install it, usually it's in the binutils package"
 				else
 					# here we disassemble the kernel and count the number of occurrences of the LFENCE opcode
 					# in non-patched kernels, this has been empirically determined as being around 40-50
@@ -1357,7 +1376,7 @@ check_variant1()
 					# so let's push the threshold to 70.
 					# v0.33+: now only count lfence opcodes after a jump, way less error-prone
 					# non patched kernel have between 0 and 20 matches, patched ones have at least 40-45
-					nb_lfence=$(objdump -d "$vmlinux" | grep -w -B1 lfence | grep -Ewc 'jmp|jne|je')
+					nb_lfence=$(${opt_arch_prefix}objdump -d "$vmlinux" | grep -w -B1 lfence | grep -Ewc 'jmp|jne|je')
 					if [ "$nb_lfence" -lt 30 ]; then
 						pstatus red NO "only $nb_lfence jump-then-lfence instructions found, should be >= 30 (heuristic)"
 					else
@@ -1614,9 +1633,9 @@ check_variant2()
 			fi
 		elif [ -n "$vmlinux" ]; then
 			# look for the symbol
-			if which nm >/dev/null 2>&1; then
+			if which ${opt_arch_prefix}nm >/dev/null 2>&1; then
 				# the proper way: use nm and look for the symbol
-				if nm "$vmlinux" 2>/dev/null | grep -qw 'noretpoline_setup'; then
+				if ${opt_arch_prefix}nm "$vmlinux" 2>/dev/null | grep -qw 'noretpoline_setup'; then
 					retpoline_compiler=1
 					pstatus green YES "noretpoline_setup found in vmlinux symbols"
 				else
@@ -1725,10 +1744,10 @@ check_variant3()
 			# same as above but in case we don't have System.map and only vmlinux, look for the
 			# nopti option that is part of the patch (kernel command line option)
 			kpti_can_tell=1
-			if ! which strings >/dev/null 2>&1; then
-				pstatus yellow UNKNOWN "missing 'strings' tool, please install it, usually it's in the binutils package"
+			if ! which ${opt_arch_prefix}strings >/dev/null 2>&1; then
+				pstatus yellow UNKNOWN "missing '${opt_arch_prefix}strings' tool, please install it, usually it's in the binutils package"
 			else
-				if strings "$vmlinux" | grep -qw nopti; then
+				if ${opt_arch_prefix}strings "$vmlinux" | grep -qw nopti; then
 					_debug "kpti_support: found nopti string in $vmlinux"
 					kpti_support=1
 				fi
